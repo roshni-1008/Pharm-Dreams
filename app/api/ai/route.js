@@ -67,32 +67,50 @@ export async function POST(req) {
   if (system) body.systemInstruction = { parts: [{ text: system }] };
   if (b.json === true) body.generationConfig = { responseMimeType: 'application/json' };
 
-  const model = 'gemini-3.8-flash';
+  // Try the chosen model first. If Google says "high demand" (503/500/429), quickly try the
+  // next model in the list so students almost never see an error.
+  const first = (process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim();
+  const models = [first, 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-2.5-flash'].filter(
+    (m, i, arr) => m && arr.indexOf(m) === i
+  );
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 55000);
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  let last = { status: 0, msg: '' };
   try {
-    const r = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-        body: JSON.stringify(body),
-        signal: ctrl.signal
+    for (let i = 0; i < models.length; i++) {
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(models[i])}:generateContent`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+          body: JSON.stringify(body),
+          signal: ctrl.signal
+        }
+      );
+      const d = await r.json().catch(() => ({}));
+      if (r.ok) {
+        const text = ((d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts) || [])
+          .map((p) => p.text || '')
+          .join('');
+        if (text) return reply({ text });
+        last = { status: 502, msg: 'empty' };
+        continue;
       }
-    );
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok) {
       const msg = String((d.error && d.error.message) || '');
-      if (r.status === 429) return reply({ error: 'Many people are using the free AI right now. Wait a minute and try again.' }, 429);
-      if (r.status === 400 && /API key/i.test(msg)) return reply({ error: 'The AI key on the server was not accepted.' }, 502);
-      if (r.status === 403 || r.status === 401) return reply({ error: 'The AI key on the server was not accepted.' }, 502);
-      return reply({ error: msg.replace(key, '') || `The AI service returned an error (${r.status}).` }, 502);
+      last = { status: r.status, msg };
+      if (r.status === 401 || r.status === 403 || (r.status === 400 && /API key/i.test(msg))) {
+        return reply({ error: 'The AI key on the server was not accepted.' }, 502);
+      }
+      if (r.status === 400) return reply({ error: 'The AI could not handle that request. Try rewording it.' }, 502);
+      // 404 (model name wrong), 429, 500, 503: try the next model
+      if (r.status === 503 || r.status === 500) await wait(400);
     }
-    const text = ((d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts) || [])
-      .map((p) => p.text || '')
-      .join('');
-    if (!text) return reply({ error: 'The AI could not answer that. Try rewording it.' }, 502);
-    return reply({ text });
+    if (last.status === 429 || last.status === 503 || last.status === 500) {
+      return reply({ error: 'The AI is very busy right now. Please try again in a minute.' }, 503);
+    }
+    if (last.msg === 'empty') return reply({ error: 'The AI could not answer that. Try rewording it.' }, 502);
+    return reply({ error: `The AI service returned an error (${last.status}).` }, 502);
   } catch (e) {
     const timedOut = e && e.name === 'AbortError';
     return reply({ error: timedOut ? 'The AI took too long. Try a shorter request.' : 'Could not reach the AI service.' }, 504);
